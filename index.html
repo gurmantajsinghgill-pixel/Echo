@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echo – your playlists</title>
+<style>
+:root{--bg:#14110f;--panel:#1d1815;--line:#2f2824;--text:#f3ece6;--mute:#a1948a;--accent:#ff6b4a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 "Trebuchet MS",system-ui,sans-serif}
+button,input{font:inherit}
+.app{display:grid;grid-template-columns:260px 1fr;grid-template-rows:1fr 152px;height:100vh;height:100dvh}
+aside{background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:16px 8px}
+aside h1{margin:0 12px 12px;font-size:22px;letter-spacing:.5px}
+.pl{display:flex;gap:10px;align-items:center;width:100%;padding:8px 12px;background:none;border:0;border-radius:8px;color:var(--text);text-align:left;cursor:pointer}
+.pl:hover,.pl.on{background:var(--line)}
+.pl img,.pl i{width:40px;height:40px;border-radius:6px;object-fit:cover;background:var(--line);flex:none}
+.pl span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+main{overflow:auto;padding:24px}
+main h2{margin:0 0 4px;font-size:28px}
+.sub{color:var(--mute);margin:0 0 20px}
+.tr{display:grid;grid-template-columns:44px 1fr;gap:12px;align-items:center;width:100%;padding:8px;background:none;border:0;border-radius:8px;color:var(--text);text-align:left;cursor:pointer}
+.tr:hover,.tr.on{background:var(--panel)}
+.tr.on b{color:var(--accent)}
+.tr img{width:44px;height:44px;border-radius:4px;background:var(--line)}
+.tr b,.tr small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.tr small{color:var(--mute);font-weight:400}
+footer{grid-column:1/-1;border-top:1px solid var(--line);background:var(--panel);padding:10px 16px}
+footer iframe{width:100%;height:152px;border:0;border-radius:12px;display:block}
+footer p{margin:0;color:var(--mute);padding-top:50px;text-align:center}
+.setup{max-width:460px;margin:8vh auto;padding:24px}
+.setup h1{font-size:34px;margin:0 0 8px}
+.setup p,.setup li{color:var(--mute)}
+.setup code{background:var(--panel);padding:2px 6px;border-radius:4px;color:var(--text);word-break:break-all}
+.setup input{width:100%;padding:12px;margin:12px 0;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--text)}
+.go{background:var(--accent);color:#1a0d08;border:0;border-radius:999px;padding:12px 24px;font-weight:700;cursor:pointer}
+.out{background:none;border:1px solid var(--line);color:var(--mute);border-radius:999px;padding:6px 14px;margin:12px;cursor:pointer}
+.err{color:#ff8a70}
+@media(max-width:700px){
+.app{grid-template-columns:1fr;grid-template-rows:auto 1fr 152px}
+aside{display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:8px}
+aside h1,.out{display:none}
+.pl{width:auto;flex:none;max-width:200px}
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const SCOPES = "playlist-read-private playlist-read-collaborative user-library-read";
+const REDIRECT = location.origin + location.pathname;
+const root = document.getElementById("root");
+const $ = (s) => document.querySelector(s);
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch(e){} },
+  del(k){ try { localStorage.removeItem(k); } catch(e){} }
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function rand(n){ const a = new Uint8Array(n); crypto.getRandomValues(a); return [...a].map(x => "abcdefghijklmnopqrstuvwxyz0123456789"[x % 36]).join(""); }
+async function challenge(v){
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v));
+  return btoa(String.fromCharCode(...new Uint8Array(d))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+
+async function login(){
+  const id = $("#cid").value.trim();
+  if(!id){ $("#msg").textContent = "Paste your Client ID first."; return; }
+  store.set("echo_cid", id);
+  const v = rand(64);
+  store.set("echo_verifier", v);
+  const p = new URLSearchParams({
+    client_id: id, response_type: "code", redirect_uri: REDIRECT,
+    scope: SCOPES, code_challenge_method: "S256", code_challenge: await challenge(v)
+  });
+  location.href = "https://accounts.spotify.com/authorize?" + p;
+}
+
+async function token(body){
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: new URLSearchParams({client_id: store.get("echo_cid"), ...body})
+  });
+  if(!r.ok) throw new Error("Spotify rejected the login. Check the Client ID and Redirect URI.");
+  const d = await r.json();
+  store.set("echo_token", d.access_token);
+  if(d.refresh_token) store.set("echo_refresh", d.refresh_token);
+  store.set("echo_exp", String(Date.now() + d.expires_in * 1000 - 60000));
+}
+
+async function ensureToken(){
+  if(Number(store.get("echo_exp")) > Date.now()) return store.get("echo_token");
+  const rt = store.get("echo_refresh");
+  if(!rt) throw new Error("expired");
+  await token({grant_type: "refresh_token", refresh_token: rt});
+  return store.get("echo_token");
+}
+
+async function api(url){
+  const t = await ensureToken();
+  const r = await fetch(url.startsWith("http") ? url : "https://api.spotify.com/v1" + url, {headers: {Authorization: "Bearer " + t}});
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+async function all(url){
+  let out = [];
+  while(url){ const d = await api(url); out = out.concat(d.items || []); url = d.next; }
+  return out;
+}
+
+function logout(){ ["echo_token","echo_refresh","echo_exp","echo_verifier"].forEach(store.del); location.href = REDIRECT; }
+
+function showSetup(err){
+  root.innerHTML = `<div class="setup">
+    <h1>Echo</h1>
+    <p>Log in with Spotify and your playlists appear here automatically.</p>
+    <ol>
+      <li>Open the Spotify Developer Dashboard and create an app.</li>
+      <li>Add this Redirect URI to it: <code>${esc(REDIRECT)}</code></li>
+      <li>Paste the app's Client ID below.</li>
+    </ol>
+    <input id="cid" placeholder="Client ID" value="${esc(store.get("echo_cid") || "")}" autocomplete="off">
+    <button class="go" id="loginBtn">Log in with Spotify</button>
+    <p id="msg" class="err">${esc(err || "")}</p>
+  </div>`;
+  $("#loginBtn").onclick = login;
+}
+
+let playlists = [], tracks = [], current = null;
+
+async function showApp(){
+  root.innerHTML = `<div class="app">
+    <aside><h1>Echo</h1><div id="pls"><p class="sub" style="margin:12px">Loading playlists…</p></div><button class="out" id="outBtn">Log out</button></aside>
+    <main id="main"><p class="sub">Pick a playlist.</p></main>
+    <footer id="player"><p>Choose a song to play.</p></footer>
+  </div>`;
+  $("#outBtn").onclick = logout;
+  try {
+    const mine = await all("/me/playlists?limit=50");
+    playlists = [{id: "liked", name: "Liked Songs", images: []}, ...mine.filter(Boolean)];
+    drawLists();
+    openList("liked");
+  } catch(e){
+    $("#pls").innerHTML = `<p class="err" style="margin:12px">Couldn't load playlists. Log out and try again.</p>`;
+  }
+}
+
+function drawLists(){
+  $("#pls").innerHTML = playlists.map(p => {
+    const img = p.images && p.images[0] ? `<img src="${esc(p.images[0].url)}" alt="">` : `<i></i>`;
+    return `<button class="pl" data-id="${esc(p.id)}">${img}<span>${esc(p.name)}</span></button>`;
+  }).join("");
+  document.querySelectorAll(".pl").forEach(b => b.onclick = () => openList(b.dataset.id));
+}
+
+async function openList(id){
+  document.querySelectorAll(".pl").forEach(b => b.classList.toggle("on", b.dataset.id === id));
+  const p = playlists.find(x => x.id === id);
+  $("#main").innerHTML = `<h2>${esc(p.name)}</h2><p class="sub" id="count">Loading songs…</p><div id="list"></div>`;
+  try {
+    let items;
+    if(id === "liked") items = await all("/me/tracks?limit=50");
+    else {
+      try { items = await all(`/playlists/${id}/items?limit=50`); }
+      catch(e){ items = await all(`/playlists/${id}/tracks?limit=50`); }
+    }
+    tracks = items.map(i => i.track || i.item).filter(t => t && t.id && t.type !== "episode");
+    $("#count").textContent = tracks.length + " songs";
+    $("#list").innerHTML = tracks.map((t, n) => {
+      const art = t.album && t.album.images && t.album.images.length ? t.album.images[t.album.images.length - 1].url : "";
+      return `<button class="tr" data-n="${n}"><img src="${esc(art)}" alt=""><span><b>${esc(t.name)}</b><small>${esc((t.artists || []).map(a => a.name).join(", "))}</small></span></button>`;
+    }).join("");
+    document.querySelectorAll(".tr").forEach(b => b.onclick = () => play(Number(b.dataset.n)));
+  } catch(e){
+    $("#count").className = "sub err";
+    $("#count").textContent = "Couldn't load this playlist. Spotify only shares playlists you own or collaborate on with new apps.";
+  }
+}
+
+function play(n){
+  const t = tracks[n];
+  current = t.id;
+  document.querySelectorAll(".tr").forEach(b => b.classList.toggle("on", Number(b.dataset.n) === n));
+  $("#player").innerHTML = `<iframe src="https://open.spotify.com/embed/track/${encodeURIComponent(t.id)}?theme=0" allow="autoplay; clipboard-write; encrypted-media; fullscreen" loading="lazy" title="Player"></iframe>`;
+}
+
+(async function init(){
+  const q = new URLSearchParams(location.search);
+  if(q.get("error")){ history.replaceState({}, "", REDIRECT); return showSetup("Spotify login was cancelled."); }
+  if(q.get("code")){
+    try {
+      await token({grant_type: "authorization_code", code: q.get("code"), redirect_uri: REDIRECT, code_verifier: store.get("echo_verifier")});
+      history.replaceState({}, "", REDIRECT);
+    } catch(e){ history.replaceState({}, "", REDIRECT); return showSetup(e.message); }
+  }
+  try { await ensureToken(); showApp(); } catch(e){ showSetup(); }
+})();
+</script>
+</body>
+</html>
